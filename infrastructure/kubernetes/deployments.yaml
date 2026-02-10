@@ -1,0 +1,155 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: streaming-platform
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-processor
+  namespace: streaming-platform
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: stream-processor
+  template:
+    metadata:
+      labels:
+        app: stream-processor
+    spec:
+      containers:
+        - name: stream-processor
+          image: streaming-platform:latest
+          command: ["python", "-m", "src.processors.stream_processor"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: streaming-config
+                  key: kafka.bootstrap.servers
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: streaming-config
+                  key: redis.host
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          ports:
+            - containerPort: 8000
+              name: metrics
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-sink
+  namespace: streaming-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: event-sink
+  template:
+    metadata:
+      labels:
+        app: event-sink
+    spec:
+      containers:
+        - name: event-sink
+          image: streaming-platform:latest
+          command: ["python", "-m", "src.consumers.postgres_sink"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: streaming-config
+                  key: kafka.bootstrap.servers
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: host
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stream-processor-hpa
+  namespace: streaming-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stream-processor
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: consumer_lag
+        target:
+          type: AverageValue
+          averageValue: "1000"
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streaming-config
+  namespace: streaming-platform
+data:
+  kafka.bootstrap.servers: "kafka.kafka.svc.cluster.local:9092"
+  redis.host: "redis.streaming-platform.svc.cluster.local"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-processor-metrics
+  namespace: streaming-platform
+spec:
+  selector:
+    app: stream-processor
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: metrics
